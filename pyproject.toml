@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=64.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "awq_quantizer"
+version = "0.1.0"
+description = "A tool for converting multi-file BF16 Safetensors models to I32 FP16 AWQ quantized models"
+readme = "README.md"
+authors = [
+    {name = "AWQ Quantizer Team", email = "your.email@example.com"}
+]
+license = {file = "LICENSE"}
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.12"
+dependencies = [
+    "safetensors>=0.4.0",
+    "huggingface_hub>=0.19.0",
+    "torch>=2.0.0",
+    "numpy>=1.24.0",
+    "transformers>=4.30.0",
+    "tqdm>=4.65.0",
+    "bitsandbytes>=0.45.0",
+    "accelerate>=0.20.0",
+    "pyyaml>=6.0",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/yourusername/awq_quantizer"
+"Bug Tracker" = "https://github.com/yourusername/awq_quantizer/issues"
+
+[project.scripts]
+awq_quantizer = "awq_quantizer.main:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"] 

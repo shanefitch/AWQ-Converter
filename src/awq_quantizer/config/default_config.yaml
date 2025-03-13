@@ -1,0 +1,64 @@
+# Default configuration for AWQ Quantizer
+
+# Model settings
+model:
+  # Path to the model or model ID on Hugging Face Hub
+  path: ""
+  # Hugging Face Hub model ID (e.g., 'facebook/opt-350m')
+  hub_model_id: ""
+  # Whether the model is on Hugging Face Hub
+  from_hub: false
+  # Model revision to use (if from_hub is true)
+  revision: "main"
+  # Token to use for private models (if from_hub is true)
+  token: null
+
+# Quantization settings
+quantization:
+  # Quantization method (currently only AWQ is supported)
+  method: "awq"
+  # Bit width for quantization (4 or 8)
+  bits: 4
+  # Group size for quantization (default: 128)
+  group_size: 128
+  # Whether to use symmetric quantization
+  symmetric: true
+  # Zero-point calibration method (none, minmax, percentile)
+  zero_point: "minmax"
+  # Percentile value if zero_point is "percentile"
+  percentile: 0.99
+  # Scale calibration method (minmax, mse)
+  scale_method: "mse"
+  # Whether to use per-channel quantization
+  per_channel: true
+  # Whether to skip certain layers from quantization
+  skip_layers: []
+
+# Output settings
+output:
+  # Directory to save the quantized model
+  dir: "quantized_model"
+  # Whether to save in safetensors format
+  safetensors: true
+  # Whether to save model in FP16 format
+  fp16: true
+  # Whether to save model in INT32 format
+  int32: true
+
+# Logging settings
+logging:
+  # Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+  level: "INFO"
+  # Whether to log to file
+  to_file: true
+  # Log file path
+  file_path: "quantization.log"
+
+# Hardware settings
+hardware:
+  # Device to use for computation (cpu, cuda, mps)
+  device: "cuda"
+  # Number of CPU threads to use
+  num_threads: 4
+  # Whether to use mixed precision
+  mixed_precision: true 

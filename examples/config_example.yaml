@@ -1,0 +1,32 @@
+# AWQ Quantizer Configuration Example
+
+# Model configuration
+model:
+  # Use either local_path or hub_model_id, not both
+  # local_path: "/path/to/local/model"
+  hub_model_id: "facebook/opt-125m"
+  revision: "main"  # Optional: specific model revision
+  # token: "hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"  # Optional: for private models
+  cache_dir: null  # Optional: custom cache directory
+
+# Output configuration
+output:
+  dir: "./quantized_model"
+  format: "safetensors"  # Options: safetensors, pytorch
+  metadata:
+    description: "AWQ quantized model"
+    quantization_method: "AWQ"
+    original_model: "facebook/opt-125m"
+    quantization_date: "2023-10-15"
+
+# Quantization parameters
+quantization:
+  bits: 4  # Quantization bit-width (4 or 8)
+  group_size: 128  # Group size for quantization
+  zero_point: true  # Whether to use zero point in quantization
+  use_fp16_scale: true  # Whether to use FP16 for scale factors
+  scale_dtype: "fp16"  # Data type for scales: fp16 or fp32
+  symmetric: false  # Whether to use symmetric quantization
+  calibration_method: "minmax"  # Options: minmax, percentile, mse
+  calibration_percdamp: 0.01  # Percentile damping factor
+  calibration_percentile: 0.999  # Percentile for calibration 
