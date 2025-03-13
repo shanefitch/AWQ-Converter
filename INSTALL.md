@@ -14,8 +14,8 @@ This guide provides instructions for installing and setting up the AWQ Quantizer
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/awq_quantizer.git
-   cd awq_quantizer
+   git clone https://github.com/shanefitch/AWQ-Converter.git
+   cd AWQ-Converter
    ```
 
 2. Create a virtual environment (optional but recommended):
@@ -42,7 +42,7 @@ This guide provides instructions for installing and setting up the AWQ Quantizer
 
 ```bash
 # Install directly from GitHub
-pip install git+https://github.com/yourusername/awq_quantizer.git
+pip install git+https://github.com/shanefitch/AWQ-Converter.git
 ```
 
 ## Verifying Installation

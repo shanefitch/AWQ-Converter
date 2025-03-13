@@ -34,8 +34,8 @@ dependencies = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/yourusername/awq_quantizer"
-"Bug Tracker" = "https://github.com/yourusername/awq_quantizer/issues"
+"Homepage" = "https://github.com/shanefitch/AWQ-Converter"
+"Bug Tracker" = "https://github.com/shanefitch/AWQ-Converter/issues"
 
 [project.scripts]
 awq_quantizer = "awq_quantizer.main:main"

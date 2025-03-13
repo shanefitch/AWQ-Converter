@@ -21,8 +21,8 @@ This project provides a pipeline for loading, processing, and quantizing large l
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/awq_quantizer.git
-cd awq_quantizer
+git clone https://github.com/shanefitch/AWQ-Converter.git
+cd AWQ-Converter
 
 # Create a virtual environment (optional but recommended)
 python -m venv awq_env
