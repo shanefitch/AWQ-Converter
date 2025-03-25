@@ -6,6 +6,7 @@ This script checks if:
 1. The main package can be imported
 2. The submodules can be imported
 3. The command-line tool is available
+4. GPU acceleration is available and lists all GPUs
 
 Usage:
     python test_installation.py
@@ -15,7 +16,7 @@ Usage:
 import importlib
 import subprocess
 import sys
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 def check_module(module_name: str) -> bool:
@@ -50,21 +51,69 @@ def check_command(command: str) -> bool:
         return False
 
 
-def check_gpu_support() -> Tuple[bool, Optional[str]]:
-    """Check if CUDA is available through PyTorch."""
+def check_gpu_support() -> Tuple[bool, List[Dict[str, str]]]:
+    """Check if CUDA is available through PyTorch and list all GPUs."""
     try:
         import torch
         if torch.cuda.is_available():
             device_count = torch.cuda.device_count()
-            device_name = torch.cuda.get_device_name(0) if device_count > 0 else None
-            print(f"✅ CUDA is available with {device_count} device(s): {device_name}")
-            return True, device_name
+            print(f"✅ CUDA is available with {device_count} device(s)")
+            
+            # Get info for each GPU
+            gpu_info = []
+            for i in range(device_count):
+                device_name = torch.cuda.get_device_name(i)
+                device_props = torch.cuda.get_device_properties(i)
+                
+                # Calculate memory info
+                total_memory_gb = device_props.total_memory / (1024 ** 3)
+                
+                # Get compute capability
+                compute_capability = f"{device_props.major}.{device_props.minor}"
+                
+                # Store GPU info
+                gpu_info.append({
+                    "index": i,
+                    "name": device_name,
+                    "memory": f"{total_memory_gb:.2f} GB",
+                    "compute_capability": compute_capability
+                })
+                
+                # Print GPU info
+                print(f"  GPU {i}: {device_name}")
+                print(f"    - Memory: {total_memory_gb:.2f} GB")
+                print(f"    - Compute Capability: {compute_capability}")
+                
+            return True, gpu_info
         else:
             print("⚠️ CUDA is not available. GPU acceleration will not be used.")
-            return False, None
+            return False, []
     except ImportError:
         print("⚠️ Failed to import torch. Cannot check CUDA availability.")
-        return False, None
+        return False, []
+
+
+def check_multi_gpu_support() -> bool:
+    """Check if the AWQ Quantizer supports multi-GPU processing."""
+    try:
+        # Check if the multi_gpu argument exists in the CLI
+        result = subprocess.run(
+            ["awq_quantizer", "--help"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False
+        )
+        
+        if "--multi_gpu" in result.stdout:
+            print("✅ Multi-GPU support is available")
+            return True
+        else:
+            print("⚠️ Multi-GPU support is not detected in the CLI")
+            return False
+    except Exception as e:
+        print(f"⚠️ Could not determine multi-GPU support: {e}")
+        return False
 
 
 def main():
@@ -89,14 +138,27 @@ def main():
     command_ok = check_command("awq_quantizer --help")
     
     # Check GPU support
-    gpu_available, gpu_name = check_gpu_support()
+    gpu_available, gpu_info = check_gpu_support()
+    
+    # Check multi-GPU support
+    multi_gpu_ok = check_multi_gpu_support() if command_ok else False
     
     # Print summary
     print("\nInstallation Summary\n" + "=" * 30)
     if main_module_ok and all(submodule_checks) and command_ok:
         print("✅ AWQ Quantizer is installed correctly!")
         if gpu_available:
-            print(f"✅ GPU acceleration is available using: {gpu_name}")
+            gpu_count = len(gpu_info)
+            if gpu_count == 1:
+                print(f"✅ GPU acceleration is available: {gpu_info[0]['name']}")
+            else:
+                print(f"✅ Multi-GPU acceleration is available with {gpu_count} GPUs")
+                
+            # Print multi-GPU support status
+            if multi_gpu_ok and gpu_count > 1:
+                print("✅ Multi-GPU processing is supported and can be enabled with --multi_gpu flag")
+            elif gpu_count > 1:
+                print("⚠️ Multiple GPUs detected but multi-GPU support may not be available")
         else:
             print("⚠️ GPU acceleration is not available. Quantization will be slower.")
     else:
