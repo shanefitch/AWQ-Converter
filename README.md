@@ -115,3 +115,19 @@ python test_quantization.py --use_hub
 ## Acknowledgements
 
 This project implements the AWQ quantization method as described in the paper [AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration](https://arxiv.org/abs/2306.00978). 
+
+# Load from Hub
+loader = load_model_from_hub(
+    model_id="facebook/opt-350m",
+    resume_download=True,
+    verify_downloads=True
+)
+
+# Or load locally
+loader = load_model_from_path(
+    model_path="/path/to/model",
+    verify_files=True
+)
+
+# Then use the loader
+tensors = loader.load_tensors() 

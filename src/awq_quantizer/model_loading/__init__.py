@@ -1,112 +1,151 @@
 """
-Model loading package.
+Model loading module for AWQ Quantizer.
 """
 
-from typing import Optional, List
+from typing import Dict, List, Optional, Tuple, Union
 import os
-from huggingface_hub import snapshot_download, hf_hub_download
-from ..utils.tensor_utils import filter_safetensor_files, is_consolidated_file
+import hashlib
+
+import torch
+from huggingface_hub import snapshot_download
+from safetensors import safe_open
+
+from .safetensors_loader import SafetensorsLoader
+from ..utils.logger import get_logger
+from ..utils.tensor_utils import get_model_files, is_consolidated_file
+
+
+def verify_file_hash(file_path: str, expected_hash: Optional[str] = None) -> str:
+    """
+    Verify a file's SHA256 hash.
+
+    Args:
+        file_path: Path to the file
+        expected_hash: Expected SHA256 hash (if None, just returns the computed hash)
+
+    Returns:
+        Computed SHA256 hash
+
+    Raises:
+        ValueError: If the computed hash doesn't match the expected hash
+    """
+    sha256_hash = hashlib.sha256()
+    
+    with open(file_path, "rb") as f:
+        # Read the file in chunks to handle large files
+        for chunk in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(chunk)
+    
+    computed_hash = sha256_hash.hexdigest()
+    
+    if expected_hash and computed_hash != expected_hash:
+        raise ValueError(
+            f"Hash verification failed for {file_path}. "
+            f"Expected: {expected_hash}, Got: {computed_hash}"
+        )
+    
+    return computed_hash
+
 
 def load_model_from_hub(
     model_id: str,
-    revision: Optional[str] = None,
+    revision: str = "main",
     token: Optional[str] = None,
-    cache_dir: Optional[str] = None,
-    allow_patterns: Optional[List[str]] = None,
-) -> str:
+    logger_name: str = "model_loading",
+    logger_level: str = "INFO",
+    logger_to_file: bool = False,
+    logger_file_path: Optional[str] = None,
+    resume_download: bool = True,
+    force_download: bool = False,
+    verify_downloads: bool = True,
+) -> SafetensorsLoader:
     """
     Load a model from the Hugging Face Hub.
-    
+
     Args:
-        model_id: The model ID on Hugging Face Hub
-        revision: Optional git revision to use
-        token: Optional authentication token
-        cache_dir: Optional directory to cache files
-        allow_patterns: Optional list of file patterns to download
-        
+        model_id: Model ID on Hugging Face Hub
+        revision: Model revision to use
+        token: Token to use for private models
+        logger_name: Logger name
+        logger_level: Logging level
+        logger_to_file: Whether to log to file
+        logger_file_path: Log file path
+        resume_download: Whether to resume partial downloads
+        force_download: Whether to force re-download of files
+        verify_downloads: Whether to verify downloaded files
+
     Returns:
-        Path to the downloaded model files
+        SafetensorsLoader instance
     """
-    # Default to downloading only safetensors files if no patterns specified
-    if allow_patterns is None:
-        allow_patterns = ["*.safetensors"]
-    
+    logger = get_logger(
+        name=logger_name,
+        level=logger_level,
+        to_file=logger_to_file,
+        file_path=logger_file_path,
+    )
+
     try:
-        # First try to find a consolidated file
-        consolidated_file = None
-        try:
-            # List files in the repo
-            from huggingface_hub import list_repo_files
-            files = list_repo_files(model_id, revision=revision, token=token)
-            
-            # Look for consolidated file
-            safetensor_files = [f for f in files if f.endswith('.safetensors')]
-            consolidated_files = [f for f in safetensor_files if 'consolidated' in f.lower()]
-            
-            if consolidated_files:
-                # Download just the consolidated file
-                consolidated_file = hf_hub_download(
-                    repo_id=model_id,
-                    filename=consolidated_files[0],
-                    revision=revision,
-                    token=token,
-                    cache_dir=cache_dir,
-                )
-        except Exception:
-            # If listing files fails, fall back to downloading all files
-            pass
-            
-        if consolidated_file:
-            print(f"Using consolidated model file: {os.path.basename(consolidated_file)}")
-            return os.path.dirname(consolidated_file)
-            
-        # If no consolidated file or error, download all safetensor files
-        print("Downloading all model files...")
+        # Try to download the entire snapshot first
         local_dir = snapshot_download(
             repo_id=model_id,
             revision=revision,
             token=token,
-            cache_dir=cache_dir,
-            allow_patterns=allow_patterns,
+            resume_download=resume_download,
+            force_download=force_download,
         )
-        return local_dir
+        logger.info(f"Successfully downloaded model snapshot to {local_dir}")
         
     except Exception as e:
-        raise ValueError(f"Error loading model from Hugging Face Hub: {e}")
+        logger.warning(f"Failed to download model snapshot: {e}")
+        logger.info("Falling back to individual file downloads")
+        local_dir = None
 
-def load_model(
-    local_path: Optional[str] = None,
-    hub_model_id: Optional[str] = None,
-    revision: Optional[str] = None,
-    token: Optional[str] = None,
-    cache_dir: Optional[str] = None,
-) -> str:
+    # Create the loader instance
+    loader = SafetensorsLoader(
+        model_path=model_id if local_dir is None else local_dir,
+        from_hub=True if local_dir is None else False,
+        revision=revision,
+        token=token,
+        logger_name=logger_name,
+        logger_level=logger_level,
+        logger_to_file=logger_to_file,
+        logger_file_path=logger_file_path,
+        resume_download=resume_download,
+        force_download=force_download,
+    )
+
+    return loader
+
+
+def load_model_from_path(
+    model_path: str,
+    logger_name: str = "model_loading",
+    logger_level: str = "INFO",
+    logger_to_file: bool = False,
+    logger_file_path: Optional[str] = None,
+    verify_files: bool = True,
+) -> SafetensorsLoader:
     """
-    Load a model from either local path or Hugging Face Hub.
-    
+    Load a model from a local path.
+
     Args:
-        local_path: Path to local model files
-        hub_model_id: Model ID on Hugging Face Hub
-        revision: Optional git revision to use
-        token: Optional authentication token
-        cache_dir: Optional directory to cache files
-        
+        model_path: Path to the model
+        logger_name: Logger name
+        logger_level: Logging level
+        logger_to_file: Whether to log to file
+        logger_file_path: Log file path
+        verify_files: Whether to verify local files
+
     Returns:
-        Path to the model files
+        SafetensorsLoader instance
     """
-    if local_path and hub_model_id:
-        raise ValueError("Cannot specify both local_path and hub_model_id")
-    elif not local_path and not hub_model_id:
-        raise ValueError("Must specify either local_path or hub_model_id")
-        
-    if hub_model_id:
-        return load_model_from_hub(
-            model_id=hub_model_id,
-            revision=revision,
-            token=token,
-            cache_dir=cache_dir,
-        )
-    else:
-        if not os.path.exists(local_path):
-            raise ValueError(f"Local path does not exist: {local_path}")
-        return local_path 
+    return SafetensorsLoader(
+        model_path=model_path,
+        from_hub=False,
+        logger_name=logger_name,
+        logger_level=logger_level,
+        logger_to_file=logger_to_file,
+        logger_file_path=logger_file_path,
+        resume_download=False,  # Not used for local files
+        force_download=False,  # Not used for local files
+    ) 
