@@ -8,7 +8,7 @@ import argparse
 import time
 import logging
 import json
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import torch
@@ -92,19 +92,24 @@ def parse_args() -> argparse.Namespace:
         "--device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device to use for quantization (cuda, cuda:0, cuda:1, cpu)",
+        help="Device to use for quantization (cuda, cuda:0, cuda:1, cpu, or 'all' for all GPUs)",
     )
     parser.add_argument(
         "--num_workers",
         type=int,
         default=4,
-        help="Number of worker threads for parallel processing",
+        help="Number of worker threads for parallel processing per GPU",
     )
     parser.add_argument(
         "--max_memory",
         type=float,
         default=0.8,
         help="Maximum fraction of GPU memory to use (0.0-1.0)",
+    )
+    parser.add_argument(
+        "--multi_gpu",
+        action="store_true",
+        help="Use all available GPUs for processing (overrides --device)",
     )
     
     # Logging arguments
@@ -135,6 +140,60 @@ def parse_args() -> argparse.Namespace:
     )
     
     return parser.parse_args()
+
+
+def get_available_gpus(logger=None) -> List[str]:
+    """
+    Get a list of available CUDA devices.
+    
+    Args:
+        logger: Optional logger instance
+        
+    Returns:
+        List of device strings (e.g., ["cuda:0", "cuda:1"])
+    """
+    if not torch.cuda.is_available():
+        if logger:
+            logger.warning("No CUDA devices available")
+        return []
+    
+    devices = []
+    device_count = torch.cuda.device_count()
+    
+    for i in range(device_count):
+        device_name = torch.cuda.get_device_name(i)
+        if logger:
+            logger.info(f"Found CUDA device {i}: {device_name}")
+        devices.append(f"cuda:{i}")
+    
+    return devices
+
+
+def get_device_memory_info(device_idx: int) -> Tuple[float, float]:
+    """
+    Get memory information for a CUDA device.
+    
+    Args:
+        device_idx: Device index
+        
+    Returns:
+        Tuple of (total_memory_gb, free_memory_gb)
+    """
+    if not torch.cuda.is_available():
+        return 0.0, 0.0
+    
+    try:
+        # Get total memory
+        total_memory = torch.cuda.get_device_properties(device_idx).total_memory
+        total_memory_gb = total_memory / 1024**3
+        
+        # Get free memory
+        free_memory = torch.cuda.memory_reserved(device_idx) - torch.cuda.memory_allocated(device_idx)
+        free_memory_gb = free_memory / 1024**3
+        
+        return total_memory_gb, free_memory_gb
+    except Exception:
+        return 0.0, 0.0
 
 
 def prepare_tensors_for_quantization(
@@ -222,14 +281,23 @@ def prepare_tensors_for_quantization(
                 if 'available_memory' in locals():
                     available_memory -= tensor_size
                 
-                # Move to GPU
-                prepared_tensors[name] = tensor.to(device)
-                
-                if logger and logger.level <= logging.DEBUG:
-                    logger.debug(
-                        f"Moved tensor {name} (shape: {tensor.shape}, " 
-                        f"size: {tensor_size / 1024**2:.2f} MB) to {device}"
-                    )
+                try:
+                    # Move to GPU
+                    prepared_tensors[name] = tensor.to(device)
+                    
+                    if logger and logger.level <= logging.DEBUG:
+                        logger.debug(
+                            f"Moved tensor {name} (shape: {tensor.shape}, " 
+                            f"size: {tensor_size / 1024**2:.2f} MB) to {device}"
+                        )
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower():
+                        if logger:
+                            logger.warning(f"GPU OOM when loading tensor {name}, processing on CPU instead: {e}")
+                        # Keep on CPU if CUDA OOM
+                        prepared_tensors[name] = tensor
+                    else:
+                        raise
         else:
             # CPU processing, just add the tensor
             prepared_tensors[name] = tensor
@@ -266,14 +334,23 @@ def quantize_tensor_batch(
     
     for name, tensor in tensor_items:
         if logger:
-            logger.info(f"Quantizing tensor: {name}")
+            logger.info(f"Quantizing tensor: {name} on {device}")
             
         try:
             # Move tensor to target device if needed
             if tensor.device.type != device.split(':')[0] or (
-                ':' in device and tensor.device.index != int(device.split(':')[1])
+                ':' in device and str(tensor.device).split(':')[1] != device.split(':')[1]
             ):
-                tensor = tensor.to(device)
+                try:
+                    tensor = tensor.to(device)
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower() and device != "cpu":
+                        if logger:
+                            logger.warning(f"GPU OOM when moving tensor {name} to {device}, falling back to CPU: {e}")
+                        device = "cpu"
+                        tensor = tensor.to("cpu")
+                    else:
+                        raise
                 
             # Quantize tensor
             quantized_tensor = quantizer.quantize(tensor)
@@ -287,14 +364,49 @@ def quantize_tensor_batch(
             quantized_tensors[name] = quantized_tensor
             
             if logger:
-                logger.info(f"Successfully quantized tensor: {name}")
+                logger.info(f"Successfully quantized tensor: {name} on {device}")
                 
         except Exception as e:
             if logger:
-                logger.error(f"Failed to quantize tensor {name}: {e}")
+                logger.error(f"Failed to quantize tensor {name} on {device}: {e}")
             continue
             
     return quantized_tensors
+
+
+def partition_tensors(tensors: Dict[str, torch.Tensor], num_partitions: int) -> List[Dict[str, torch.Tensor]]:
+    """
+    Partition tensors across multiple devices by balancing tensor sizes.
+    
+    Args:
+        tensors: Dictionary of tensors
+        num_partitions: Number of partitions to create
+        
+    Returns:
+        List of tensor dictionaries, one for each partition
+    """
+    if num_partitions <= 1:
+        return [tensors]
+    
+    # Calculate tensor sizes
+    tensor_sizes = [(name, tensor.numel() * tensor.element_size()) for name, tensor in tensors.items()]
+    # Sort by size (largest first)
+    tensor_sizes.sort(key=lambda x: x[1], reverse=True)
+    
+    # Create partitions with approximately equal total size
+    partitions = [dict() for _ in range(num_partitions)]
+    partition_sizes = [0] * num_partitions
+    
+    # Distribute tensors using a greedy approach
+    for name, size in tensor_sizes:
+        # Find partition with smallest total size
+        min_idx = partition_sizes.index(min(partition_sizes))
+        # Add tensor to this partition
+        partitions[min_idx][name] = tensors[name]
+        # Update partition size
+        partition_sizes[min_idx] += size
+    
+    return partitions
 
 
 def save_model_in_chunks(
@@ -401,32 +513,34 @@ def main() -> int:
         # Create output directory
         os.makedirs(args.output_dir, exist_ok=True)
         
-        # Log device information
-        if args.device.startswith("cuda"):
-            if torch.cuda.is_available():
-                device_count = torch.cuda.device_count()
-                logger.info(f"Found {device_count} CUDA device(s)")
-                
-                device_idx = 0
-                if ":" in args.device:
-                    device_idx = int(args.device.split(":")[1])
-                
-                if device_idx < device_count:
-                    device_name = torch.cuda.get_device_name(device_idx)
-                    device_properties = torch.cuda.get_device_properties(device_idx)
-                    
-                    logger.info(f"Using GPU {device_idx}: {device_name}")
-                    logger.info(f"  Total memory: {device_properties.total_memory / 1024**3:.2f} GB")
-                    logger.info(f"  CUDA capability: {device_properties.major}.{device_properties.minor}")
-                else:
-                    logger.warning(f"Requested GPU {device_idx} not available, falling back to CPU")
-                    args.device = "cpu"
+        # Check if we should use all GPUs
+        if args.multi_gpu or args.device.lower() == "all":
+            available_devices = get_available_gpus(logger)
+            if not available_devices:
+                logger.warning("No CUDA devices available, falling back to CPU")
+                devices = ["cpu"]
             else:
-                logger.warning("CUDA requested but not available, falling back to CPU")
-                args.device = "cpu"
-        
-        if args.device == "cpu":
-            logger.info("Using CPU for quantization")
+                devices = available_devices
+                logger.info(f"Using {len(devices)} GPU(s) for processing")
+        else:
+            devices = [args.device]
+            
+        # Log device information for each device
+        for device in devices:
+            if device.startswith("cuda"):
+                if torch.cuda.is_available():
+                    device_idx = int(device.split(':')[1]) if ':' in device else 0
+                    device_name = torch.cuda.get_device_name(device_idx)
+                    total_memory_gb, free_memory_gb = get_device_memory_info(device_idx)
+                    
+                    logger.info(f"Using GPU {device}: {device_name}")
+                    logger.info(f"  Total memory: {total_memory_gb:.2f} GB")
+                    logger.info(f"  Free memory: {free_memory_gb:.2f} GB")
+                else:
+                    logger.warning(f"CUDA device {device} requested but not available, falling back to CPU")
+                    devices = ["cpu"]
+            elif device == "cpu":
+                logger.info("Using CPU for quantization")
         
         # Load model tensors
         logger.info(f"Loading model from {args.model_id}")
@@ -438,12 +552,13 @@ def main() -> int:
             logger.error(f"Failed to load model: {e}")
             return 1
         
-        # Prepare tensors for quantization
+        # Prepare tensors for quantization (keep on CPU at this stage)
         logger.info("Preparing tensors for quantization")
         start_time = time.time()
+        # Initially keep tensors on CPU to distribute them later
         prepared_tensors = prepare_tensors_for_quantization(
             model_tensors, 
-            device=args.device, 
+            device="cpu", 
             max_memory_fraction=args.max_memory,
             logger=logger
         )
@@ -455,60 +570,81 @@ def main() -> int:
         
         logger.info(f"Found {len(prepared_tensors)} tensors for quantization (Preparation took {prep_time:.2f}s)")
         
-        # Initialize quantizer
-        logger.info("Initializing quantizer")
-        quantizer = AWQQuantizer(
-            bits=args.bits,
-            group_size=args.group_size,
-            symmetric=args.symmetric,
-            zero_point=args.zero_point,
-            percentile=args.percentile,
-            scale_method=args.scale_method,
-            per_channel=args.per_channel,
-            logger_name="awq_quantizer",
-            logger_level=args.log_level,
-            logger_to_file=args.log_file is not None,
-            logger_file_path=args.log_file,
-        )
+        # If using multiple devices, partition tensors
+        if len(devices) > 1:
+            logger.info(f"Partitioning tensors across {len(devices)} devices")
+            partitioned_tensors = partition_tensors(prepared_tensors, len(devices))
+            
+            # Log partition distribution
+            for i, partition in enumerate(partitioned_tensors):
+                logger.info(f"Partition {i} for {devices[i]}: {len(partition)} tensors")
+        else:
+            # No need to partition if using a single device
+            partitioned_tensors = [prepared_tensors]
+            
+        # Initialize quantizers for each device
+        logger.info("Initializing quantizers")
+        quantizers = {}
+        for device in devices:
+            quantizers[device] = AWQQuantizer(
+                bits=args.bits,
+                group_size=args.group_size,
+                symmetric=args.symmetric,
+                zero_point=args.zero_point,
+                percentile=args.percentile,
+                scale_method=args.scale_method,
+                per_channel=args.per_channel,
+                device=device,  # Set device for each quantizer
+                logger_name=f"awq_quantizer_{device}",
+                logger_level=args.log_level,
+                logger_to_file=args.log_file is not None,
+                logger_file_path=args.log_file,
+            )
         
         # Quantize tensors with parallel processing
-        logger.info(f"Starting quantization with {args.num_workers} worker threads")
+        logger.info(f"Starting quantization with {args.num_workers} worker threads per device")
         start_time = time.time()
         
-        if args.num_workers > 1:
-            # Divide tensors into batches for workers
-            tensor_items = list(prepared_tensors.items())
-            batch_size = max(1, len(tensor_items) // args.num_workers)
-            batches = [tensor_items[i:i+batch_size] for i in range(0, len(tensor_items), batch_size)]
-            
-            # Use ThreadPoolExecutor for parallel processing
-            quantized_tensors = {}
-            with ThreadPoolExecutor(max_workers=args.num_workers) as executor:
-                # Submit batches to executor
-                future_to_batch = {
-                    executor.submit(
-                        quantize_tensor_batch, batch, quantizer, args.device, logger
-                    ): i for i, batch in enumerate(batches)
-                }
+        # Process each partition on its assigned device
+        quantized_tensors = {}
+        futures = []
+        
+        with ThreadPoolExecutor(max_workers=args.num_workers * len(devices)) as executor:
+            # Submit tasks for each device partition
+            for device_idx, device in enumerate(devices):
+                if device_idx >= len(partitioned_tensors):
+                    continue  # Skip if no partition for this device
+                    
+                partition = partitioned_tensors[device_idx]
+                if not partition:
+                    continue  # Skip empty partitions
                 
-                # Process results as they complete
-                for future in as_completed(future_to_batch):
-                    batch_result = future.result()
+                # Divide tensors into batches for workers
+                tensor_items = list(partition.items())
+                workers_per_device = max(1, min(args.num_workers, len(tensor_items)))
+                batch_size = max(1, len(tensor_items) // workers_per_device)
+                batches = [tensor_items[i:i+batch_size] for i in range(0, len(tensor_items), batch_size)]
+                
+                # Submit batches to executor
+                for batch_idx, batch in enumerate(batches):
+                    future = executor.submit(
+                        quantize_tensor_batch, 
+                        batch, 
+                        quantizers[device], 
+                        device, 
+                        logger
+                    )
+                    futures.append((future, device, batch_idx, len(batches)))
+            
+            # Process results as they complete
+            for future, device, batch_idx, total_batches in [f for f in futures if f[0]]:
+                try:
+                    batch_result = future[0].result()
                     quantized_tensors.update(batch_result)
                     
-                    batch_idx = future_to_batch[future]
-                    logger.info(f"Completed batch {batch_idx+1}/{len(batches)} ({len(batch_result)} tensors)")
-        else:
-            # Sequential processing
-            quantized_tensors = {}
-            for name, tensor in prepared_tensors.items():
-                logger.info(f"Quantizing tensor: {name}")
-                try:
-                    quantized_tensors[name] = quantizer.quantize(tensor)
-                    logger.info(f"Successfully quantized tensor: {name}")
+                    logger.info(f"Completed batch {batch_idx+1}/{total_batches} on {device} ({len(batch_result)} tensors)")
                 except Exception as e:
-                    logger.error(f"Failed to quantize tensor {name}: {e}")
-                    continue
+                    logger.error(f"Error processing batch on {device}: {e}")
         
         quant_time = time.time() - start_time
         
@@ -518,12 +654,14 @@ def main() -> int:
         
         logger.info(f"Quantized {len(quantized_tensors)} tensors in {quant_time:.2f} seconds")
         
-        # Clean up memory if using CUDA
-        if args.device.startswith("cuda"):
-            torch.cuda.empty_cache()
-            if logger.level <= logging.DEBUG:
-                memory_allocated = torch.cuda.memory_allocated() / 1024**3
-                logger.debug(f"GPU memory after quantization: {memory_allocated:.2f} GB")
+        # Clean up memory for all CUDA devices
+        if torch.cuda.is_available():
+            for device_idx in range(torch.cuda.device_count()):
+                with torch.cuda.device(device_idx):
+                    torch.cuda.empty_cache()
+                if logger.level <= logging.DEBUG:
+                    memory_allocated = torch.cuda.memory_allocated(device_idx) / 1024**3
+                    logger.debug(f"GPU {device_idx} memory after quantization: {memory_allocated:.2f} GB")
         
         # Save quantized tensors
         logger.info(f"Saving {len(quantized_tensors)} quantized tensors to {args.output_dir}")
