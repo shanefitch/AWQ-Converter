@@ -9,7 +9,7 @@ from typing import Dict, List, Optional, Union
 
 import torch
 
-from .config import load_config
+from .utils.config import load_config
 from .model_loading import load_model_from_hub, load_model_from_path
 from .quantization import AWQQuantizer
 from .utils.logger import get_logger
