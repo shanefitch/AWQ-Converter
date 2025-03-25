@@ -11,7 +11,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 from ..utils.logger import get_logger
-from ..utils.tensor_utils import convert_bf16_to_fp16, get_tensor_type
+from ..utils.tensor_utils import convert_bf16_to_fp16, get_tensor_type, get_model_files, is_consolidated_file
 
 
 class SafetensorsLoader:
@@ -55,65 +55,17 @@ class SafetensorsLoader:
             file_path=logger_file_path,
         )
         
-        self.model_files = []
-        self.tensors_metadata = {}
-        
-        # Find model files
-        self._find_model_files()
-
-    def _find_model_files(self) -> None:
-        """
-        Find model files.
-        """
-        if self.from_hub:
-            # Get model files from Hugging Face Hub
-            self.logger.info(f"Finding model files from Hugging Face Hub: {self.model_path}")
+        self.model_files = get_model_files(model_path)
+        if not self.model_files:
+            raise ValueError(f"No safetensor files found in {model_path}")
             
-            try:
-                # Get model info
-                from huggingface_hub import model_info
-                
-                info = model_info(
-                    self.model_path,
-                    revision=self.revision,
-                    token=self.token,
-                )
-                
-                # Filter safetensors files
-                self.model_files = [
-                    file.rfilename
-                    for file in info.siblings
-                    if file.rfilename.endswith(".safetensors")
-                ]
-                
-                self.logger.info(f"Found {len(self.model_files)} safetensors files")
-            
-            except Exception as e:
-                self.logger.error(f"Error finding model files from Hugging Face Hub: {e}")
-                raise
-        
+        # Log info about found files
+        if len(self.model_files) == 1 and is_consolidated_file(self.model_files[0]):
+            print(f"Found consolidated model file: {os.path.basename(self.model_files[0])}")
         else:
-            # Get model files from local path
-            self.logger.info(f"Finding model files from local path: {self.model_path}")
-            
-            if os.path.isfile(self.model_path) and self.model_path.endswith(".safetensors"):
-                # Single file
-                self.model_files = [os.path.basename(self.model_path)]
-                self.model_path = os.path.dirname(self.model_path)
-            
-            elif os.path.isdir(self.model_path):
-                # Directory
-                self.model_files = [
-                    file
-                    for file in os.listdir(self.model_path)
-                    if file.endswith(".safetensors")
-                ]
-            
-            else:
-                self.logger.error(f"Invalid model path: {self.model_path}")
-                raise ValueError(f"Invalid model path: {self.model_path}")
-            
-            self.logger.info(f"Found {len(self.model_files)} safetensors files")
+            print(f"Found {len(self.model_files)} model files:")
+            for file in self.model_files:
+                print(f"  - {os.path.basename(file)}")
 
     def get_tensor_names(self) -> List[str]:
         """
@@ -139,20 +91,20 @@ class SafetensorsLoader:
         Returns:
             Dictionary mapping tensor names to metadata
         """
-        if not self.tensors_metadata:
-            for file in self.model_files:
-                file_path = self._get_file_path(file)
-                
-                with safe_open(file_path, framework="pt") as f:
-                    for key in f.keys():
-                        tensor_info = f.get_tensor_info(key)
-                        self.tensors_metadata[key] = {
-                            "dtype": tensor_info.dtype,
-                            "shape": tensor_info.shape,
-                            "file": file,
-                        }
+        metadata = {}
+        for file in self.model_files:
+            file_path = self._get_file_path(file)
+            
+            with safe_open(file_path, framework="pt") as f:
+                for key in f.keys():
+                    tensor_info = f.get_tensor_info(key)
+                    metadata[key] = {
+                        "dtype": tensor_info.dtype,
+                        "shape": tensor_info.shape,
+                        "file": file,
+                    }
         
-        return self.tensors_metadata
+        return metadata
 
     def load_tensor(self, name: str) -> torch.Tensor:
         """

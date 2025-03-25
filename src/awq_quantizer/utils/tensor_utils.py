@@ -3,6 +3,7 @@ Tensor utility functions for AWQ Quantizer.
 """
 
 import torch
+import os
 from typing import Dict, List, Optional, Tuple, Union
 
 
@@ -200,4 +201,78 @@ def get_device_from_config(config: Dict) -> torch.device:
     if device_str == "mps" and not hasattr(torch.backends, "mps") and not torch.backends.mps.is_available():
         return torch.device("cpu")
     
-    return torch.device(device_str) 
+    return torch.device(device_str)
+
+
+def filter_safetensor_files(file_paths: List[str]) -> List[str]:
+    """
+    Filter a list of safetensor file paths to exclude consolidated files when individual files exist.
+    
+    Args:
+        file_paths: List of paths to safetensor files
+        
+    Returns:
+        List of safetensor file paths with consolidated files removed if individual files exist
+    """
+    # First, separate consolidated and individual files
+    consolidated_files = []
+    individual_files = []
+    
+    for path in file_paths:
+        if not path.endswith('.safetensors'):
+            continue
+            
+        filename = os.path.basename(path)
+        if 'consolidated' in filename.lower():
+            consolidated_files.append(path)
+        else:
+            individual_files.append(path)
+    
+    # If we have individual files, ignore consolidated ones
+    if individual_files:
+        return individual_files
+    # Otherwise, use consolidated files if they exist
+    elif consolidated_files:
+        return consolidated_files
+    # If neither exists, return empty list
+    return []
+
+
+def is_consolidated_file(file_path: str) -> bool:
+    """
+    Check if a file path represents a consolidated safetensor file.
+    
+    Args:
+        file_path: Path to the safetensor file
+        
+    Returns:
+        True if the file is a consolidated safetensor file, False otherwise
+    """
+    if not file_path.endswith('.safetensors'):
+        return False
+        
+    filename = os.path.basename(file_path)
+    return 'consolidated' in filename.lower()
+
+
+def get_model_files(model_path: str) -> List[str]:
+    """
+    Get all relevant model files from a directory, handling consolidated files appropriately.
+    
+    Args:
+        model_path: Path to the model directory or file
+        
+    Returns:
+        List of paths to model files to load
+    """
+    if os.path.isfile(model_path):
+        return [model_path] if model_path.endswith('.safetensors') else []
+        
+    # Get all safetensor files in directory
+    safetensor_files = []
+    for root, _, files in os.walk(model_path):
+        for file in files:
+            if file.endswith('.safetensors'):
+                safetensor_files.append(os.path.join(root, file))
+                
+    return filter_safetensor_files(safetensor_files) 
