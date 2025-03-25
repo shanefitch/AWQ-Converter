@@ -607,9 +607,11 @@ def main() -> int:
         
         # Process each partition on its assigned device
         quantized_tensors = {}
-        futures = []
         
         with ThreadPoolExecutor(max_workers=args.num_workers * len(devices)) as executor:
+            # Keep track of futures and their metadata
+            future_metadata = {}
+            
             # Submit tasks for each device partition
             for device_idx, device in enumerate(devices):
                 if device_idx >= len(partitioned_tensors):
@@ -634,16 +636,27 @@ def main() -> int:
                         device, 
                         logger
                     )
-                    futures.append((future, device, batch_idx, len(batches)))
+                    # Store metadata with the future for easy reference
+                    future_metadata[future] = {
+                        "device": device,
+                        "batch_idx": batch_idx,
+                        "total_batches": len(batches)
+                    }
             
             # Process results as they complete
-            for future, device, batch_idx, total_batches in [f for f in futures if f[0]]:
+            for future in as_completed([f for f in future_metadata.keys()]):
                 try:
-                    batch_result = future[0].result()
-                    quantized_tensors.update(batch_result)
+                    batch_result = future.result()
+                    metadata = future_metadata[future]
+                    device = metadata["device"]
+                    batch_idx = metadata["batch_idx"]
+                    total_batches = metadata["total_batches"]
                     
+                    quantized_tensors.update(batch_result)
                     logger.info(f"Completed batch {batch_idx+1}/{total_batches} on {device} ({len(batch_result)} tensors)")
                 except Exception as e:
+                    metadata = future_metadata[future]
+                    device = metadata["device"]
                     logger.error(f"Error processing batch on {device}: {e}")
         
         quant_time = time.time() - start_time
