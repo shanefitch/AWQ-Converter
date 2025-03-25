@@ -10,7 +10,7 @@ import shutil
 import torch
 from huggingface_hub import hf_hub_download
 from safetensors import safe_open
-from safetensors.torch import save_file
+from safetensors.torch import save_file, load_file
 
 from ..utils.logger import get_logger
 from ..utils.tensor_utils import convert_bf16_to_fp16, get_tensor_type, get_model_files, is_consolidated_file
@@ -143,112 +143,44 @@ class SafetensorsLoader:
                 raise ValueError(f"Local file verification failed: {file_path}")
             return file_path
 
-    def get_tensor_names(self) -> List[str]:
+    def load_tensors(self) -> Dict[str, torch.Tensor]:
         """
-        Get all tensor names from all model files.
-
-        Returns:
-            List of tensor names
-        """
-        tensor_names = []
-        
-        for file in self.model_files:
-            file_path = self._get_file_path(file)
-            
-            with safe_open(file_path, framework="pt") as f:
-                tensor_names.extend(f.keys())
-        
-        return tensor_names
-
-    def get_tensor_metadata(self) -> Dict[str, Dict]:
-        """
-        Get metadata for all tensors.
-
-        Returns:
-            Dictionary mapping tensor names to metadata
-        """
-        metadata = {}
-        for file in self.model_files:
-            file_path = self._get_file_path(file)
-            
-            with safe_open(file_path, framework="pt") as f:
-                for key in f.keys():
-                    tensor_info = f.get_tensor_info(key)
-                    metadata[key] = {
-                        "dtype": tensor_info.dtype,
-                        "shape": tensor_info.shape,
-                        "file": file,
-                    }
-        
-        return metadata
-
-    def load_tensor(self, name: str) -> torch.Tensor:
-        """
-        Load a specific tensor by name.
-
-        Args:
-            name: Tensor name
-
-        Returns:
-            Tensor
-        """
-        # Get tensor metadata
-        metadata = self.get_tensor_metadata()
-        
-        if name not in metadata:
-            self.logger.error(f"Tensor not found: {name}")
-            raise ValueError(f"Tensor not found: {name}")
-        
-        # Get file path
-        file_path = self._get_file_path(metadata[name]["file"])
-        
-        # Load tensor
-        with safe_open(file_path, framework="pt") as f:
-            tensor = f.get_tensor(name)
-        
-        self.logger.debug(f"Loaded tensor: {name}, shape: {tensor.shape}, dtype: {get_tensor_type(tensor)}")
-        
-        return tensor
-
-    def load_all_tensors(self) -> Dict[str, torch.Tensor]:
-        """
-        Load all tensors from all model files.
+        Load all tensors from safetensor files.
 
         Returns:
             Dictionary mapping tensor names to tensors
         """
         tensors = {}
         
-        # Get tensor names
-        tensor_names = self.get_tensor_names()
-        
-        # Load tensors
-        for name in tensor_names:
-            tensors[name] = self.load_tensor(name)
-        
+        for file in self.model_files:
+            file_path = self._get_file_path(file)
+            self.logger.info(f"Loading tensors from {os.path.basename(file_path)}")
+            
+            try:
+                # Load tensors from file
+                file_tensors = load_file(file_path)
+                
+                # Add to combined tensors dictionary
+                tensors.update(file_tensors)
+                
+            except Exception as e:
+                self.logger.warning(f"Error loading {file_path}: {e}")
+                # Try loading with safe_open as fallback
+                try:
+                    with safe_open(file_path, framework="pt") as f:
+                        metadata = f.metadata()
+                        if metadata:
+                            self.logger.info(f"Metadata found: {metadata}")
+                            
+                        for key in f.keys():
+                            tensors[key] = f.get_tensor(key)
+                            
+                except Exception as e2:
+                    self.logger.error(f"Failed to load {file_path} with fallback method: {e2}")
+                    raise
+                    
+        self.logger.info(f"Loaded {len(tensors)} tensors")
         return tensors
-
-    def convert_tensors_bf16_to_fp16(self, tensors: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        Convert BF16 tensors to FP16.
-
-        Args:
-            tensors: Dictionary mapping tensor names to tensors
-
-        Returns:
-            Dictionary mapping tensor names to tensors with BF16 converted to FP16
-        """
-        converted_tensors = {}
-        
-        for name, tensor in tensors.items():
-            converted_tensor = convert_bf16_to_fp16(tensor)
-            
-            if converted_tensor.dtype != tensor.dtype:
-                self.logger.debug(f"Converted tensor {name} from {get_tensor_type(tensor)} to {get_tensor_type(converted_tensor)}")
-            
-            converted_tensors[name] = converted_tensor
-        
-        return converted_tensors
 
     def save_tensors(
         self,
@@ -294,4 +226,26 @@ class SafetensorsLoader:
             
         finally:
             # Clean up temporary directory
-            shutil.rmtree(temp_dir, ignore_errors=True) 
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def convert_tensors_bf16_to_fp16(self, tensors: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        Convert BF16 tensors to FP16.
+
+        Args:
+            tensors: Dictionary mapping tensor names to tensors
+
+        Returns:
+            Dictionary mapping tensor names to tensors with BF16 converted to FP16
+        """
+        converted_tensors = {}
+        
+        for name, tensor in tensors.items():
+            converted_tensor = convert_bf16_to_fp16(tensor)
+            
+            if converted_tensor.dtype != tensor.dtype:
+                self.logger.debug(f"Converted tensor {name} from {get_tensor_type(tensor)} to {get_tensor_type(converted_tensor)}")
+            
+            converted_tensors[name] = converted_tensor
+        
+        return converted_tensors 
