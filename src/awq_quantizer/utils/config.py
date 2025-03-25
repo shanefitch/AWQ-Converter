@@ -37,10 +37,26 @@ class Config:
             user_config = self._load_yaml(config_path)
             self._update_nested_dict(self.config, user_config)
             
-        # Handle hub_model_id if present
-        if self.config.get("model", {}).get("hub_model_id"):
-            self.config["model"]["path"] = self.config["model"]["hub_model_id"]
-            self.config["model"]["from_hub"] = True
+        # Initialize model section if not present
+        if "model" not in self.config:
+            self.config["model"] = {}
+            
+        # Set defaults for model configuration
+        model_config = self.config["model"]
+        model_config.setdefault("path", "")
+        model_config.setdefault("hub_model_id", "")
+        model_config.setdefault("from_hub", False)
+        model_config.setdefault("revision", "main")
+        model_config.setdefault("token", None)
+            
+        # Handle hub_model_id from command line or config
+        if model_config["hub_model_id"]:
+            model_config["path"] = model_config["hub_model_id"]
+            model_config["from_hub"] = True
+        elif model_config["path"] and "/" in model_config["path"] and not os.path.exists(model_config["path"]):
+            # If path looks like a hub ID (contains '/') and doesn't exist locally, treat it as a hub model
+            model_config["hub_model_id"] = model_config["path"]
+            model_config["from_hub"] = True
 
     def _load_yaml(self, path: str) -> Dict[str, Any]:
         """
