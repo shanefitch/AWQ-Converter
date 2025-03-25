@@ -148,7 +148,12 @@ def main() -> int:
             zero_point=config["quantization"]["zero_point"],
             percentile=config["quantization"]["percentile"],
             symmetric=config["quantization"]["symmetric"],
-            num_threads=config["hardware"]["num_threads"],
+            scale_method=config["quantization"]["scale_method"],
+            per_channel=config["quantization"]["per_channel"],
+            logger_name="awq_quantizer",
+            logger_level=config["logging"]["level"],
+            logger_to_file=config["logging"]["to_file"],
+            logger_file_path=config["logging"]["file_path"],
         )
         
         # Load model tensors
