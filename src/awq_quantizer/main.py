@@ -4,6 +4,7 @@ Main module for AWQ Quantizer.
 
 import os
 import sys
+import argparse
 import time
 from typing import Dict, List, Optional, Union
 
@@ -15,13 +16,86 @@ from .quantization.awq import AWQQuantizer
 from .utils.logger import get_logger
 
 
+def parse_args() -> argparse.Namespace:
+    """
+    Parse command line arguments.
+
+    Returns:
+        Parsed arguments
+    """
+    parser = argparse.ArgumentParser(description="AWQ Quantizer")
+    
+    # Model arguments
+    parser.add_argument(
+        "--hub_model_id",
+        type=str,
+        help="Hugging Face Hub model ID (e.g., 'facebook/opt-350m')",
+    )
+    
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        help="Path to local model directory or file",
+    )
+    
+    parser.add_argument(
+        "--revision",
+        type=str,
+        help="Model revision to use when loading from Hugging Face Hub",
+    )
+    
+    parser.add_argument(
+        "--token",
+        type=str,
+        help="Authentication token for private models on Hugging Face Hub",
+    )
+    
+    # Output arguments
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        help="Directory to save the quantized model",
+    )
+    
+    # Configuration argument
+    parser.add_argument(
+        "--config",
+        type=str,
+        help="Path to configuration file",
+    )
+    
+    return parser.parse_args()
+
+
 def main() -> int:
     """
     Main entry point for AWQ Quantizer.
     """
     try:
+        # Parse command line arguments
+        args = parse_args()
+        
         # Load configuration
-        config = load_config()
+        config = load_config(args.config)
+        
+        # Update configuration with command line arguments
+        if args.hub_model_id:
+            config["model"]["hub_model_id"] = args.hub_model_id
+            config["model"]["path"] = args.hub_model_id
+            config["model"]["from_hub"] = True
+            
+        if args.model_path:
+            config["model"]["path"] = args.model_path
+            config["model"]["from_hub"] = False
+            
+        if args.revision:
+            config["model"]["revision"] = args.revision
+            
+        if args.token:
+            config["model"]["token"] = args.token
+            
+        if args.output_dir:
+            config["output"]["dir"] = args.output_dir
         
         # Initialize logger
         logger = get_logger(
