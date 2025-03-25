@@ -6,6 +6,7 @@ This guide will help you migrate from older versions of the AWQ Quantizer to the
 
 - **Modern Packaging**: Moved to PyPI-compatible packaging with `pyproject.toml`
 - **GPU Acceleration**: Added explicit CUDA device management
+- **Multi-GPU Support**: Automatic parallelization across all available GPUs
 - **Memory Efficiency**: Improved memory management for large models
 - **Chunked Saving**: Added support for saving large models in chunks
 - **Safetensors Format**: Added option to save in the more portable safetensors format
@@ -49,10 +50,32 @@ python -m awq_quantizer.main --model_id MODEL_ID --output_dir OUTPUT_DIR --bits 
 
 New parameters:
 - `--device`: Specify device for quantization (cuda, cuda:0, cpu)
-- `--num_workers`: Number of worker threads for parallel quantization
+- `--multi_gpu`: Use all available GPUs for parallel processing
+- `--num_workers`: Number of worker threads for parallel quantization per GPU
 - `--max_memory`: Maximum fraction of GPU memory to use
 - `--save_safetensors`: Save in safetensors format instead of PyTorch
 - `--chunk_size`: Save large models in chunks (number of tensors per chunk)
+
+#### Multi-GPU Acceleration
+
+For large models, you can now leverage all available GPUs:
+
+```bash
+# Use all available GPUs
+python -m awq_quantizer.main --model_id MODEL_ID --output_dir OUTPUT_DIR --multi_gpu --num_workers 2
+```
+
+Or use `--device all` for the same effect:
+
+```bash
+python -m awq_quantizer.main --model_id MODEL_ID --output_dir OUTPUT_DIR --device all --num_workers 2
+```
+
+The quantizer will automatically:
+1. Detect all available GPUs
+2. Partition the model tensors across GPUs based on size
+3. Process each partition in parallel
+4. Combine results into a single output model
 
 #### Python API
 
@@ -140,9 +163,11 @@ If you encounter issues after migration:
 
 4. Check the logs for any specific error messages.
 
+5. If you have multiple GPUs with different memory capacities, you might need to adjust the `--max_memory` parameter to avoid out-of-memory errors on the smaller GPUs.
+
 ## Full Example
 
-Here's a complete example of quantizing a model with all the new features:
+Here's a complete example of quantizing a model with all the new features on multiple GPUs:
 
 ```bash
 python -m awq_quantizer.main \
@@ -151,7 +176,7 @@ python -m awq_quantizer.main \
   --bits 4 \
   --group_size 128 \
   --symmetric \
-  --device cuda \
+  --multi_gpu \
   --num_workers 2 \
   --save_safetensors \
   --chunk_size 50
@@ -160,5 +185,5 @@ python -m awq_quantizer.main \
 This will:
 1. Download the Mistral 7B model from Hugging Face
 2. Quantize it using AWQ with 4-bit precision
-3. Use CUDA acceleration
+3. Utilize all available GPUs in your system
 4. Save the quantized model in safetensors format in chunks of 50 tensors each 
