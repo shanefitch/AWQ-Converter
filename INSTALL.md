@@ -4,7 +4,7 @@ This guide provides instructions for installing and setting up the AWQ Quantizer
 
 ## Prerequisites
 
-- Python 3.12 or later
+- Python 3.11 or later
 - CUDA-compatible GPU (recommended for faster quantization)
 - Internet connection (if using Hugging Face Hub integration)
 
@@ -25,7 +25,7 @@ This guide provides instructions for installing and setting up the AWQ Quantizer
    source awq_env/bin/activate  # On Windows: awq_env\Scripts\activate
    
    # Or using conda
-   conda create -n awq_env python=3.12
+   conda create -n awq_env python=3.11
    conda activate awq_env
    ```
 
