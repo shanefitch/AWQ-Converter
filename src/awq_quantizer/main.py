@@ -111,6 +111,23 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use all available GPUs for processing (overrides --device)",
     )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=10,
+        help="Number of tensors to process in each batch",
+    )
+    parser.add_argument(
+        "--prefetch_factor",
+        type=int,
+        default=2,
+        help="Number of batches to prefetch (higher values use more memory but may be faster)",
+    )
+    parser.add_argument(
+        "--memory_efficient",
+        action="store_true",
+        help="Enable memory-efficient mode (moves tensors to CPU after quantization)",
+    )
     
     # Logging arguments
     parser.add_argument(
@@ -200,116 +217,117 @@ def prepare_tensors_for_quantization(
     tensors: Dict[str, torch.Tensor], 
     device: str,
     max_memory_fraction: float = 0.8,
+    batch_size: int = 10,
     logger = None
-) -> Dict[str, torch.Tensor]:
+) -> List[Dict[str, torch.Tensor]]:
     """
-    Prepare tensors for quantization by filtering, validating, and moving them to the specified device.
+    Prepare tensors for quantization by batching them based on available GPU memory.
     
     Args:
         tensors: Dictionary of tensors from the model
         device: Device to move tensors to (cuda, cuda:0, etc.)
         max_memory_fraction: Maximum fraction of GPU memory to use (0.0-1.0)
+        batch_size: Number of tensors per batch
         logger: Logger instance
         
     Returns:
-        Dictionary of tensors ready for quantization
+        List of dictionaries containing batched tensors
     """
-    prepared_tensors = {}
-    
     # Check if using CUDA
     is_cuda = device.startswith("cuda")
+    device_idx = int(device.split(":")[1]) if ":" in device else 0 if is_cuda else None
     
-    # Get available memory if using CUDA
-    if is_cuda and logger:
-        device_idx = 0
-        if ":" in device:
-            device_idx = int(device.split(":")[1])
-        
-        total_memory = torch.cuda.get_device_properties(device_idx).total_memory
-        max_allowed_memory = int(total_memory * max_memory_fraction)
-        
-        logger.info(f"GPU {device_idx} has {total_memory / 1024**3:.2f} GB total memory")
-        logger.info(f"Using up to {max_allowed_memory / 1024**3:.2f} GB for tensors")
-        
-        # Reserve memory for quantization operations
-        current_memory = torch.cuda.memory_allocated(device_idx)
-        available_memory = max_allowed_memory - current_memory
-        
-        logger.info(f"Current memory usage: {current_memory / 1024**3:.2f} GB")
-        logger.info(f"Available memory for tensors: {available_memory / 1024**3:.2f} GB")
-    
-    # Process each tensor
+    # Calculate tensor sizes and sort by size (largest first)
+    tensor_info = []
     for name, tensor in tensors.items():
-        # Skip non-tensor values
-        if not isinstance(tensor, torch.Tensor):
+        # Skip invalid tensors
+        if not isinstance(tensor, torch.Tensor) or not tensor.is_floating_point() or tensor.numel() == 0:
             if logger:
-                logger.warning(f"Skipping non-tensor value: {name}")
-            continue
-            
-        # Skip non-floating point tensors
-        if not tensor.is_floating_point():
-            if logger:
-                logger.warning(f"Skipping non-floating point tensor: {name}")
-            continue
-            
-        # Skip tensors with no elements
-        if tensor.numel() == 0:
-            if logger:
-                logger.warning(f"Skipping empty tensor: {name}")
+                logger.warning(f"Skipping invalid tensor: {name}")
             continue
             
         # Skip tensors that are too small for grouping
-        if tensor.numel() < 128:  # Minimum size for group quantization
+        if tensor.numel() < 128:
             if logger:
                 logger.warning(f"Skipping tensor too small for grouping: {name}")
             continue
             
-        # Move tensor to device (for CUDA, check memory availability first)
-        if is_cuda:
-            tensor_size = tensor.numel() * tensor.element_size()
-            
-            if 'available_memory' in locals() and tensor_size > available_memory:
-                if logger:
-                    logger.warning(
-                        f"Tensor {name} size ({tensor_size / 1024**3:.2f} GB) exceeds available GPU memory. "
-                        f"Processing on CPU instead."
-                    )
-                # Keep on CPU if too large
-                prepared_tensors[name] = tensor
-            else:
-                # Track memory usage
-                if 'available_memory' in locals():
-                    available_memory -= tensor_size
+        size_bytes = tensor.numel() * tensor.element_size()
+        tensor_info.append((name, tensor, size_bytes))
+    
+    # Sort tensors by size (largest first)
+    tensor_info.sort(key=lambda x: x[2], reverse=True)
+    
+    if is_cuda:
+        # Get GPU memory information
+        total_memory = torch.cuda.get_device_properties(device_idx).total_memory
+        max_allowed_memory = int(total_memory * max_memory_fraction)
+        current_memory = torch.cuda.memory_allocated(device_idx)
+        available_memory = max_allowed_memory - current_memory
+        
+        if logger:
+            logger.info(f"GPU {device_idx} memory status:")
+            logger.info(f"  Total: {total_memory / 1024**3:.2f} GB")
+            logger.info(f"  Available: {available_memory / 1024**3:.2f} GB")
+            logger.info(f"  Current usage: {current_memory / 1024**3:.2f} GB")
+    
+    # Create batches
+    batches = []
+    current_batch = {}
+    current_batch_size = 0
+    current_memory = 0
+    
+    for name, tensor, size_bytes in tensor_info:
+        # Check if we should start a new batch
+        if len(current_batch) >= batch_size or (
+            is_cuda and current_memory + size_bytes > available_memory
+        ):
+            if current_batch:
+                batches.append(current_batch)
+                current_batch = {}
+                current_batch_size = 0
+                current_memory = 0
                 
+                # Clear CUDA cache between batches if using GPU
+                if is_cuda:
+                    torch.cuda.empty_cache()
+        
+        # Add tensor to current batch
+        try:
+            if is_cuda:
+                # Try to move tensor to GPU
                 try:
-                    # Move to GPU
-                    prepared_tensors[name] = tensor.to(device)
-                    
-                    if logger and logger.level <= logging.DEBUG:
-                        logger.debug(
-                            f"Moved tensor {name} (shape: {tensor.shape}, " 
-                            f"size: {tensor_size / 1024**2:.2f} MB) to {device}"
-                        )
+                    tensor = tensor.to(device)
                 except RuntimeError as e:
                     if "out of memory" in str(e).lower():
                         if logger:
-                            logger.warning(f"GPU OOM when loading tensor {name}, processing on CPU instead: {e}")
-                        # Keep on CPU if CUDA OOM
-                        prepared_tensors[name] = tensor
+                            logger.warning(f"GPU OOM when loading tensor {name}, processing on CPU")
+                        tensor = tensor.to("cpu")
                     else:
                         raise
-        else:
-            # CPU processing, just add the tensor
-            prepared_tensors[name] = tensor
             
-    if logger:
-        logger.info(f"Prepared {len(prepared_tensors)} tensors for quantization")
-        
-        if is_cuda:
-            current_memory = torch.cuda.memory_allocated(device_idx)
-            logger.info(f"Current GPU memory usage after preparation: {current_memory / 1024**3:.2f} GB")
+            current_batch[name] = tensor
+            current_batch_size += 1
+            current_memory += size_bytes
+            
+            if logger and logger.level <= logging.DEBUG:
+                logger.debug(f"Added tensor {name} to batch {len(batches)} (size: {size_bytes / 1024**2:.2f} MB)")
+                
+        except Exception as e:
+            if logger:
+                logger.error(f"Error preparing tensor {name}: {e}")
+            continue
     
-    return prepared_tensors
+    # Add final batch if not empty
+    if current_batch:
+        batches.append(current_batch)
+    
+    if logger:
+        logger.info(f"Created {len(batches)} batches with {sum(len(b) for b in batches)} total tensors")
+        if is_cuda:
+            logger.info(f"Final GPU memory usage: {torch.cuda.memory_allocated(device_idx) / 1024**3:.2f} GB")
+    
+    return batches
 
 
 def quantize_tensor_batch(
@@ -525,7 +543,7 @@ def main() -> int:
         else:
             devices = [args.device]
             
-        # Log device information for each device
+        # Log device information
         for device in devices:
             if device.startswith("cuda"):
                 if torch.cuda.is_available():
@@ -546,44 +564,16 @@ def main() -> int:
         logger.info(f"Loading model from {args.model_id}")
         try:
             model_loader = load_model_from_hub(args.model_id)
-            # Call load_tensors to get the dictionary of tensors
             model_tensors = model_loader.load_tensors()
         except Exception as e:
             logger.error(f"Failed to load model: {e}")
             return 1
         
-        # Prepare tensors for quantization (keep on CPU at this stage)
+        # Prepare tensors for quantization
         logger.info("Preparing tensors for quantization")
         start_time = time.time()
-        # Initially keep tensors on CPU to distribute them later
-        prepared_tensors = prepare_tensors_for_quantization(
-            model_tensors, 
-            device="cpu", 
-            max_memory_fraction=args.max_memory,
-            logger=logger
-        )
-        prep_time = time.time() - start_time
         
-        if not prepared_tensors:
-            logger.error("No valid tensors found for quantization")
-            return 1
-        
-        logger.info(f"Found {len(prepared_tensors)} tensors for quantization (Preparation took {prep_time:.2f}s)")
-        
-        # If using multiple devices, partition tensors
-        if len(devices) > 1:
-            logger.info(f"Partitioning tensors across {len(devices)} devices")
-            partitioned_tensors = partition_tensors(prepared_tensors, len(devices))
-            
-            # Log partition distribution
-            for i, partition in enumerate(partitioned_tensors):
-                logger.info(f"Partition {i} for {devices[i]}: {len(partition)} tensors")
-        else:
-            # No need to partition if using a single device
-            partitioned_tensors = [prepared_tensors]
-            
         # Initialize quantizers for each device
-        logger.info("Initializing quantizers")
         quantizers = {}
         for device in devices:
             quantizers[device] = AWQQuantizer(
@@ -594,91 +584,77 @@ def main() -> int:
                 percentile=args.percentile,
                 scale_method=args.scale_method,
                 per_channel=args.per_channel,
-                device=device,  # Set device for each quantizer
+                device=device,
                 logger_name=f"awq_quantizer_{device}",
                 logger_level=args.log_level,
                 logger_to_file=args.log_file is not None,
                 logger_file_path=args.log_file,
             )
         
-        # Quantize tensors with parallel processing
-        logger.info(f"Starting quantization with {args.num_workers} worker threads per device")
-        start_time = time.time()
-        
-        # Process each partition on its assigned device
+        # Process tensors in batches across devices
         quantized_tensors = {}
-        
-        with ThreadPoolExecutor(max_workers=args.num_workers * len(devices)) as executor:
-            # Keep track of futures and their metadata
-            future_metadata = {}
+        for device_idx, device in enumerate(devices):
+            logger.info(f"Processing tensors on {device}")
             
-            # Submit tasks for each device partition
-            for device_idx, device in enumerate(devices):
-                if device_idx >= len(partitioned_tensors):
-                    continue  # Skip if no partition for this device
-                    
-                partition = partitioned_tensors[device_idx]
-                if not partition:
-                    continue  # Skip empty partitions
+            # Prepare batches for this device
+            tensor_batches = prepare_tensors_for_quantization(
+                model_tensors,
+                device=device,
+                max_memory_fraction=args.max_memory,
+                batch_size=args.batch_size,
+                logger=logger
+            )
+            
+            # Process batches with multiple workers
+            with ThreadPoolExecutor(max_workers=args.num_workers) as executor:
+                futures = []
                 
-                # Divide tensors into batches for workers
-                tensor_items = list(partition.items())
-                workers_per_device = max(1, min(args.num_workers, len(tensor_items)))
-                batch_size = max(1, len(tensor_items) // workers_per_device)
-                batches = [tensor_items[i:i+batch_size] for i in range(0, len(tensor_items), batch_size)]
-                
-                # Submit batches to executor
-                for batch_idx, batch in enumerate(batches):
+                # Submit batches for processing
+                for batch_idx, batch in enumerate(tensor_batches):
                     future = executor.submit(
-                        quantize_tensor_batch, 
-                        batch, 
-                        quantizers[device], 
-                        device, 
+                        quantize_tensor_batch,
+                        list(batch.items()),
+                        quantizers[device],
+                        device,
                         logger
                     )
-                    # Store metadata with the future for easy reference
-                    future_metadata[future] = {
-                        "device": device,
-                        "batch_idx": batch_idx,
-                        "total_batches": len(batches)
-                    }
+                    futures.append((future, batch_idx, len(batch)))
+                
+                # Process results as they complete
+                for future, batch_idx, batch_size in futures:
+                    try:
+                        batch_results = future.result()
+                        quantized_tensors.update(batch_results)
+                        
+                        # Log progress
+                        logger.info(
+                            f"Completed batch {batch_idx + 1}/{len(tensor_batches)} "
+                            f"on {device} ({batch_size} tensors)"
+                        )
+                        
+                        # Clear GPU cache if memory efficient mode is enabled
+                        if args.memory_efficient and device.startswith("cuda"):
+                            torch.cuda.empty_cache()
+                            
+                    except Exception as e:
+                        logger.error(f"Error processing batch {batch_idx} on {device}: {e}")
+                        continue
             
-            # Process results as they complete
-            for future in as_completed([f for f in future_metadata.keys()]):
-                try:
-                    batch_result = future.result()
-                    metadata = future_metadata[future]
-                    device = metadata["device"]
-                    batch_idx = metadata["batch_idx"]
-                    total_batches = metadata["total_batches"]
-                    
-                    quantized_tensors.update(batch_result)
-                    logger.info(f"Completed batch {batch_idx+1}/{total_batches} on {device} ({len(batch_result)} tensors)")
-                except Exception as e:
-                    metadata = future_metadata[future]
-                    device = metadata["device"]
-                    logger.error(f"Error processing batch on {device}: {e}")
+            # Log device memory usage
+            if device.startswith("cuda"):
+                device_idx = int(device.split(':')[1]) if ':' in device else 0
+                memory_used = torch.cuda.memory_allocated(device_idx) / 1024**3
+                logger.info(f"GPU {device} memory usage: {memory_used:.2f} GB")
         
-        quant_time = time.time() - start_time
-        
+        # Save results
         if not quantized_tensors:
             logger.error("No tensors were successfully quantized")
             return 1
+            
+        logger.info(f"Successfully quantized {len(quantized_tensors)} tensors")
         
-        logger.info(f"Quantized {len(quantized_tensors)} tensors in {quant_time:.2f} seconds")
-        
-        # Clean up memory for all CUDA devices
-        if torch.cuda.is_available():
-            for device_idx in range(torch.cuda.device_count()):
-                with torch.cuda.device(device_idx):
-                    torch.cuda.empty_cache()
-                if logger.level <= logging.DEBUG:
-                    memory_allocated = torch.cuda.memory_allocated(device_idx) / 1024**3
-                    logger.debug(f"GPU {device_idx} memory after quantization: {memory_allocated:.2f} GB")
-        
-        # Save quantized tensors
-        logger.info(f"Saving {len(quantized_tensors)} quantized tensors to {args.output_dir}")
-        save_start_time = time.time()
+        # Save the quantized model
+        logger.info(f"Saving quantized model to {args.output_dir}")
         try:
             save_model_in_chunks(
                 tensors=quantized_tensors,
@@ -687,13 +663,11 @@ def main() -> int:
                 use_safetensors=args.save_safetensors,
                 logger=logger,
             )
-            save_time = time.time() - save_start_time
-            logger.info(f"Successfully saved quantized model in {save_time:.2f} seconds")
         except Exception as e:
             logger.error(f"Failed to save quantized model: {e}")
             return 1
         
-        total_time = time.time() - start_time + prep_time
+        total_time = time.time() - start_time
         logger.info(f"Quantization complete in {total_time:.2f} seconds")
         return 0
         

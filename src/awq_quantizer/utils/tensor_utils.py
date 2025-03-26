@@ -275,4 +275,40 @@ def get_model_files(model_path: str) -> List[str]:
             if file.endswith('.safetensors'):
                 safetensor_files.append(os.path.join(root, file))
                 
-    return filter_safetensor_files(safetensor_files) 
+    return filter_safetensor_files(safetensor_files)
+
+
+def filter_consolidated_files(files: List[str]) -> List[str]:
+    """
+    Filter out consolidated files if individual files exist.
+    
+    This is useful when loading model files, as consolidated files are redundant
+    if the individual files are present. The consolidated files contain the same
+    weights as the individual files, just combined into a single file.
+    
+    Args:
+        files: List of file paths
+        
+    Returns:
+        Filtered list of files with consolidated files removed if individual files exist
+    """
+    # If only one file, return it regardless
+    if len(files) <= 1:
+        return files
+        
+    # Split into consolidated and individual files
+    consolidated = []
+    individual = []
+    
+    for file in files:
+        if is_consolidated_file(file):
+            consolidated.append(file)
+        else:
+            individual.append(file)
+            
+    # If we have individual files, ignore consolidated ones
+    if individual:
+        return sorted(individual)
+    
+    # Otherwise return consolidated files
+    return sorted(consolidated) 

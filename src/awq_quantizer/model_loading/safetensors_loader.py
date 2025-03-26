@@ -3,17 +3,15 @@ Safetensors loader module for AWQ Quantizer.
 """
 
 import os
-from typing import Dict, List, Optional, Tuple, Union
-import tempfile
-import shutil
+from typing import Dict, Optional
 
 import torch
 from huggingface_hub import hf_hub_download
 from safetensors import safe_open
-from safetensors.torch import save_file, load_file
+from safetensors.torch import load_file
 
 from ..utils.logger import get_logger
-from ..utils.tensor_utils import convert_bf16_to_fp16, get_tensor_type, get_model_files, is_consolidated_file
+from ..utils.tensor_utils import convert_bf16_to_fp16, get_tensor_type, get_model_files, is_consolidated_file, filter_consolidated_files
 
 
 class SafetensorsLoader:
@@ -67,13 +65,14 @@ class SafetensorsLoader:
         if not self.model_files:
             raise ValueError(f"No safetensor files found in {model_path}")
             
-        # Log info about found files
-        if len(self.model_files) == 1 and is_consolidated_file(self.model_files[0]):
-            self.logger.info(f"Found consolidated model file: {os.path.basename(self.model_files[0])}")
-        else:
-            self.logger.info(f"Found {len(self.model_files)} model files:")
-            for file in self.model_files:
-                self.logger.info(f"  - {os.path.basename(file)}")
+        # Filter out consolidated files if individual files exist
+        self.model_files = filter_consolidated_files(self.model_files)
+        self.logger.info(f"Loading {len(self.model_files)} safetensors files:")
+        for file in self.model_files:
+            self.logger.info(f"  - {os.path.basename(file)}")
+            
+        # Initialize tensors dictionary
+        self.tensors: Dict[str, torch.Tensor] = {}
 
     def verify_file(self, file_path: str) -> bool:
         """
@@ -145,88 +144,63 @@ class SafetensorsLoader:
 
     def load_tensors(self) -> Dict[str, torch.Tensor]:
         """
-        Load all tensors from safetensor files.
+        Load tensors from safetensors files.
 
         Returns:
             Dictionary mapping tensor names to tensors
         """
-        tensors = {}
+        self.tensors = {}
         
+        # Load each file
         for file in self.model_files:
-            file_path = self._get_file_path(file)
-            self.logger.info(f"Loading tensors from {os.path.basename(file_path)}")
-            
             try:
                 # Load tensors from file
-                file_tensors = load_file(file_path)
+                file_tensors = load_file(file)
                 
-                # Add to combined tensors dictionary
-                tensors.update(file_tensors)
+                # Add tensors to dictionary
+                for name, tensor in file_tensors.items():
+                    if name in self.tensors:
+                        self.logger.warning(f"Duplicate tensor name: {name}")
+                    self.tensors[name] = tensor
+                    
+                self.logger.debug(f"Loaded {len(file_tensors)} tensors from {os.path.basename(file)}")
                 
             except Exception as e:
-                self.logger.warning(f"Error loading {file_path}: {e}")
-                # Try loading with safe_open as fallback
-                try:
-                    with safe_open(file_path, framework="pt") as f:
-                        metadata = f.metadata()
-                        if metadata:
-                            self.logger.info(f"Metadata found: {metadata}")
-                            
-                        for key in f.keys():
-                            tensors[key] = f.get_tensor(key)
-                            
-                except Exception as e2:
-                    self.logger.error(f"Failed to load {file_path} with fallback method: {e2}")
-                    raise
-                    
-        self.logger.info(f"Loaded {len(tensors)} tensors")
-        return tensors
+                self.logger.error(f"Error loading {os.path.basename(file)}: {e}")
+                raise
+                
+        self.logger.info(f"Loaded {len(self.tensors)} total tensors")
+        return self.tensors
 
     def save_tensors(
         self,
         tensors: Dict[str, torch.Tensor],
         output_dir: str,
         filename: str = "model.safetensors",
-        metadata: Optional[Dict[str, str]] = None,
-    ) -> str:
+    ) -> None:
         """
-        Save tensors to a safetensors file with atomic write.
+        Save tensors to safetensors file.
 
         Args:
             tensors: Dictionary mapping tensor names to tensors
             output_dir: Output directory
             filename: Output filename
-            metadata: Metadata to save with the tensors
-
-        Returns:
-            Path to the saved file
         """
-        # Create output directory
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Create a temporary file
-        temp_dir = tempfile.mkdtemp(dir=output_dir)
-        temp_path = os.path.join(temp_dir, filename)
-        final_path = os.path.join(output_dir, filename)
+        from safetensors.torch import save_file
         
         try:
-            # Save tensors to temporary file
-            save_file(tensors, temp_path, metadata=metadata)
+            # Create output directory
+            os.makedirs(output_dir, exist_ok=True)
             
-            # Verify the saved file
-            if not self.verify_file(temp_path):
-                raise ValueError("Failed to verify saved file")
+            # Save tensors
+            output_path = os.path.join(output_dir, filename)
+            save_file(tensors, output_path)
             
-            # Atomically move the file to its final location
-            shutil.move(temp_path, final_path)
+            self.logger.info(f"Saved {len(tensors)} tensors to {output_path}")
             
-            self.logger.info(f"Saved tensors to {final_path}")
-            
-            return final_path
-            
-        finally:
-            # Clean up temporary directory
-            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception as e:
+            self.logger.error(f"Error saving tensors: {e}")
+            raise
 
     def convert_tensors_bf16_to_fp16(self, tensors: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
